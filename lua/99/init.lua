@@ -247,11 +247,7 @@ local _99 = {
 
 --- you can only set those marks after the visual selection is removed
 local function set_selection_marks()
-  vim.api.nvim_feedkeys(
-    vim.api.nvim_replace_termcodes("<Esc>", true, false, true),
-    "x",
-    false
-  )
+  vim.api.nvim_feedkeys(vim.api.nvim_replace_termcodes("<Esc>", true, false, true), "nx", false)
 end
 
 --- @param cb fun(ok: boolean, o: _99.ops.Opts?): nil
