@@ -254,26 +254,37 @@ local function set_selection_marks()
   )
 end
 
---- @param cb fun(ok: boolean, o: _99.ops.Opts?): nil
+--- @param cb fun(context: _99.RequestContext, o: _99.ops.Opts?): nil
 --- @param context _99.RequestContext
 --- @param opts _99.ops.Opts
---- @return fun(ok: boolean, response: string): nil
-local function wrap_window_capture(cb, context, opts)
-  --- @param ok boolean
-  --- @param response string
-  return function(ok, response)
-    context.logger:debug("capture_prompt", "success", ok, "response", response)
-    if not ok then
-      return cb(false)
-    end
-    local rules_and_names = Agents.by_name(_99_state.rules, response)
-    opts.additional_rules = opts.additional_rules or {}
-    for _, r in ipairs(rules_and_names.rules) do
-      table.insert(opts.additional_rules, r)
-    end
-    opts.additional_prompt = response
-    cb(true, opts)
-  end
+local function capture_prompt(cb, context, opts)
+  Window.capture_input({
+    --- @param ok boolean
+    --- @param response string
+    cb = function(ok, response)
+      context.logger:debug(
+        "capture_prompt",
+        "success",
+        ok,
+        "response",
+        response
+      )
+      if not ok then
+        return
+      end
+      local rules_and_names = Agents.by_name(_99_state.rules, response)
+      opts.additional_rules = opts.additional_rules or {}
+      for _, r in ipairs(rules_and_names.rules) do
+        table.insert(opts.additional_rules, r)
+      end
+      opts.additional_prompt = response
+      cb(context, opts)
+    end,
+    on_load = function()
+      Extensions.setup_buffer(_99_state)
+    end,
+    rules = _99_state.rules,
+  })
 end
 
 --- @param operation_name string
@@ -311,25 +322,25 @@ function _99:rule_from_path(path)
   return Agents.get_rule_by_path(_99_state.rules, path)
 end
 
+--- @param opts? _99.ops.SearchOpts
+function _99.search(opts)
+  local o = process_opts(opts) --[[ @as _99.ops.SearchOpts ]]
+  local context = get_context("search")
+  if o.additional_prompt then
+    ops.search(context, o)
+    return
+  else
+    capture_prompt(ops.search, context, o)
+  end
+end
+
 --- @param opts? _99.ops.Opts
 function _99.fill_in_function_prompt(opts)
   opts = process_opts(opts)
   local context = get_context("fill-in-function-with-prompt")
 
   context.logger:debug("start")
-  Window.capture_input({
-    cb = wrap_window_capture(function(ok, o)
-      if not ok then
-        return
-      end
-      assert(o ~= nil, "if ok, then opts must exist")
-      ops.fill_in_function(context, o)
-    end, context, opts),
-    on_load = function()
-      Extensions.setup_buffer(_99_state)
-    end,
-    rules = _99_state.rules,
-  })
+  capture_prompt(ops.fill_in_function, context, opts)
 end
 
 --- @param opts? _99.ops.Opts
@@ -343,19 +354,7 @@ function _99.visual_prompt(opts)
   opts = process_opts(opts)
   local context = get_context("over-range-with-prompt")
   context.logger:debug("start")
-  Window.capture_input({
-    cb = wrap_window_capture(function(ok, o)
-      if not ok then
-        return
-      end
-      assert(o ~= nil, "if ok, then opts must exist")
-      _99.visual(context, o)
-    end, context, opts),
-    on_load = function()
-      Extensions.setup_buffer(_99_state)
-    end,
-    rules = _99_state.rules,
-  })
+  capture_prompt(_99.visual, context, opts)
 end
 
 --- @param context _99.RequestContext?
