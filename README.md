@@ -5,6 +5,9 @@ a few things changed.  completion is a bit different for skills.  i now require 
 # WARNING :: API CHANGES RIGHT NOW
 It will happen that apis will disapear or be changed.  Sorry, this is an ALPHA product.
 
+# 99
+The AI client that Neovim deserves, built by those that still enjoy to code.
+
 # API
 * visual
 * search (upcoming, not ready yet)
