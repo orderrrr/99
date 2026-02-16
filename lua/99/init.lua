@@ -12,6 +12,7 @@ local Extensions = require("99.extensions")
 local Agents = require("99.extensions.agents")
 local Providers = require("99.providers")
 local time = require("99.time")
+local Throbber = require("99.ops.throbber")
 
 ---@param path_or_rule string | _99.Agents.Rule
 ---@return _99.Agents.Rule | string
@@ -42,30 +43,40 @@ end
 
 --- @alias _99.Cleanup fun(): nil
 
---- @class _99.RequestEntry
---- @field id number
---- @field operation string
---- @field status "running" | "success" | "failed" | "cancelled"
---- @field filename string
---- @field lnum number
---- @field col number
---- @field started_at number
+--- @class _99.RequestEntry.Data.Tutorial
+--- @field type "tutorial"
+--- @field title string
+--- @field content string[]
 
---- @class _99.ActiveRequest
---- @field clean_up _99.Cleanup
---- @field request_id number
+--- @class _99.RequestEntry.Data.Search
+--- @field type "search"
+
+--- @class _99.RequestEntry.Data.Visual
+--- @field type "visual"
+
+---
+--- @alias _99.RequestEntry.Data _99.RequestEntry.Data.Search | _99.RequestEntry.Data.Tutorial | _99.RequestEntry.Data.Visual
+
+--- @class _99.RequestEntry
+--- @field context _99.RequestContext
+--- @field status _99.Request.State
+--- @field point _99.Point
+--- @field started_at number
+--- @field operation_data _99.RequestEntry.Data | nil
 
 --- @class _99.StateProps
 --- @field model string
 --- @field md_files string[]
 --- @field prompts _99.Prompts
 --- @field ai_stdout_rows number
+--- @field show_in_flight_requests boolean
 --- @field languages string[]
 --- @field display_errors boolean
 --- @field auto_add_skills boolean
 --- @field provider_override _99.Providers.BaseProvider?
---- @field __active_requests table<number, _99.ActiveRequest>
 --- @field __view_log_idx number
+--- @field __tutorials _99.RequestEntry.Data.Tutorial[]
+--- @field __searches _99.RequestEntry.Data.Search[]
 --- @field __request_history _99.RequestEntry[]
 --- @field __request_by_id table<number, _99.RequestEntry>
 
@@ -76,11 +87,13 @@ local function create_99_state()
     md_files = {},
     prompts = require("99.prompt-settings"),
     ai_stdout_rows = 3,
+    show_in_flight_requests = false,
     languages = { "lua", "go", "java", "elixir", "cpp", "ruby" },
     display_errors = false,
     provider_override = nil,
     auto_add_skills = false,
-    __active_requests = {},
+    __tutorials = {},
+    __searches = {},
     __view_log_idx = 1,
     __request_history = {},
     __request_by_id = {},
@@ -90,10 +103,12 @@ end
 --- @class _99.Completion
 --- @field source "cmp" | nil
 --- @field custom_rules string[]
+--- @field files _99.Files.Config?
 
 --- @class _99.Options
 --- @field logger _99.Logger.Options?
 --- @field model string?
+--- @field show_in_flight_requests boolean?
 --- @field md_files string[]?
 --- @field provider _99.Providers.BaseProvider?
 --- @field debug_log_prefix string?
@@ -111,13 +126,18 @@ end
 --- @field ai_stdout_rows number
 --- @field languages string[]
 --- @field display_errors boolean
+--- @field show_in_flight_requests boolean
+--- @field show_in_flight_requests_window _99.window.Window | nil
+--- @field show_in_flight_requests_throbber _99.Throbber | nil
 --- @field provider_override _99.Providers.BaseProvider?
 --- @field auto_add_skills boolean
 --- @field rules _99.Agents.Rules
---- @field __active_requests table<number, _99.ActiveRequest>
 --- @field __view_log_idx number
 --- @field __request_history _99.RequestEntry[]
+--- @field __tutorials _99.RequestEntry.Data.Tutorial[]
+--- @field __searches _99.RequestEntry.Data.Search[]
 --- @field __request_by_id table<number, _99.RequestEntry>
+--- @field __active_marks _99.Mark[]
 local _99_State = {}
 _99_State.__index = _99_State
 
@@ -145,46 +165,64 @@ end
 --- @param context _99.RequestContext
 --- @return _99.RequestEntry
 function _99_State:track_request(context)
+  assert(
+    context.operation,
+    "must have an operation defined to track the request"
+  )
+
   local point = context.range and context.range.start or Point:from_cursor()
   local entry = {
-    id = context.xid,
-    operation = context.operation or "request",
-    status = "running",
-    filename = context.full_path,
-    lnum = point.row,
-    col = point.col,
+    context = context,
+    status = "requesting",
+    point = point,
     started_at = time.now(),
+    operation_data = nil,
   }
   table.insert(self.__request_history, entry)
-  self.__request_by_id[entry.id] = entry
+  self.__request_by_id[context.xid] = entry
   return entry
 end
 
---- @param id number
---- @param status "success" | "failed" | "cancelled"
-function _99_State:finish_request(id, status)
+--- @param context _99.RequestContext
+--- @param status _99.Request.ResponseState
+function _99_State:finish_request(context, status)
+  local id = context.xid
   local entry = self.__request_by_id[id]
-  if entry then
-    entry.status = status
+  if not entry then
+    return
+  end
+
+  entry.status = status
+  local data = entry.operation_data
+  if entry.status == "success" and data then
+    if data.type == "tutorial" then
+      table.insert(self.__tutorials, data)
+    elseif data.type == "search" then
+      table.insert(self.__searches, data)
+    end
   end
 end
 
 --- @param id number
-function _99_State:remove_request(id)
-  for i, entry in ipairs(self.__request_history) do
-    if entry.id == id then
-      table.remove(self.__request_history, i)
-      break
-    end
+---@param data _99.RequestEntry.Data
+function _99_State:add_data(id, data)
+  local entry = self.__request_by_id[id]
+  if not entry then
+    return
   end
-  self.__request_by_id[id] = nil
+  local logger = Logger:set_id(id)
+  logger:assert(
+    entry.context.operation == data.type,
+    "the data type is not the same as the operation"
+  )
+  entry.operation_data = data
 end
 
 --- @return number
 function _99_State:previous_request_count()
   local count = 0
   for _, entry in ipairs(self.__request_history) do
-    if entry.status ~= "running" then
+    if entry.status ~= "requesting" then
       count = count + 1
     end
   end
@@ -194,44 +232,30 @@ end
 function _99_State:clear_previous_requests()
   local keep = {}
   for _, entry in ipairs(self.__request_history) do
-    if entry.status == "running" then
+    if entry.status == "requesting" then
       table.insert(keep, entry)
     else
-      self.__request_by_id[entry.id] = nil
+      self.__request_by_id[entry.context.xid] = nil
     end
   end
   self.__request_history = keep
+  self.__searches = {}
+  self.__tutorials = {}
 end
 
-local _active_request_id = 0
----@param clean_up _99.Cleanup
----@param request_id number
----@return number
-function _99_State:add_active_request(clean_up, request_id)
-  _active_request_id = _active_request_id + 1
-  Logger:debug("adding active request", "id", _active_request_id)
-  self.__active_requests[_active_request_id] = {
-    clean_up = clean_up,
-    request_id = request_id,
-  }
-  return _active_request_id
+--- @param mark _99.Mark
+function _99_State:add_mark(mark)
+  table.insert(self.__active_marks, mark)
 end
 
 function _99_State:active_request_count()
   local count = 0
-  for _ in pairs(self.__active_requests) do
-    count = count + 1
+  for _, r in pairs(self.__request_history) do
+    if r.status == "requesting" then
+      count = count + 1
+    end
   end
   return count
-end
-
----@param id number
-function _99_State:remove_active_request(id)
-  local logger = Logger:set_id(id)
-  local r = self.__active_requests[id]
-  logger:assert(r, "there is no active request for id.  implementation broken")
-  logger:debug("removing active request")
-  self.__active_requests[id] = nil
 end
 
 local _99_state = _99_State.new()
@@ -250,26 +274,38 @@ local function set_selection_marks()
   vim.api.nvim_feedkeys(vim.api.nvim_replace_termcodes("<Esc>", true, false, true), "nx", false)
 end
 
---- @param cb fun(ok: boolean, o: _99.ops.Opts?): nil
+--- @param cb fun(context: _99.RequestContext, o: _99.ops.Opts?): nil
+--- @param name string
 --- @param context _99.RequestContext
 --- @param opts _99.ops.Opts
---- @return fun(ok: boolean, response: string): nil
-local function wrap_window_capture(cb, context, opts)
-  --- @param ok boolean
-  --- @param response string
-  return function(ok, response)
-    context.logger:debug("capture_prompt", "success", ok, "response", response)
-    if not ok then
-      return cb(false)
-    end
-    local rules_and_names = Agents.by_name(_99_state.rules, response)
-    opts.additional_rules = opts.additional_rules or {}
-    for _, r in ipairs(rules_and_names.rules) do
-      table.insert(opts.additional_rules, r)
-    end
-    opts.additional_prompt = response
-    cb(true, opts)
-  end
+local function capture_prompt(cb, name, context, opts)
+  Window.capture_input(name, {
+    --- @param ok boolean
+    --- @param response string
+    cb = function(ok, response)
+      context.logger:debug(
+        "capture_prompt",
+        "success",
+        ok,
+        "response",
+        response
+      )
+      if not ok then
+        return
+      end
+      local rules_and_names = Agents.by_name(_99_state.rules, response)
+      opts.additional_rules = opts.additional_rules or {}
+      for _, r in ipairs(rules_and_names.rules) do
+        table.insert(opts.additional_rules, r)
+      end
+      opts.additional_prompt = response
+      cb(context, opts)
+    end,
+    on_load = function()
+      Extensions.setup_buffer(_99_state)
+    end,
+    rules = _99_state.rules,
+  })
 end
 
 --- @param operation_name string
@@ -307,66 +343,43 @@ function _99:rule_from_path(path)
   return Agents.get_rule_by_path(_99_state.rules, path)
 end
 
---- @param opts? _99.ops.Opts
-function _99.fill_in_function_prompt(opts)
-  opts = process_opts(opts)
-  local context = get_context("fill-in-function-with-prompt")
-
-  context.logger:debug("start")
-  Window.capture_input({
-    cb = wrap_window_capture(function(ok, o)
-      if not ok then
-        return
-      end
-      assert(o ~= nil, "if ok, then opts must exist")
-      ops.fill_in_function(context, o)
-    end, context, opts),
-    on_load = function()
-      Extensions.setup_buffer(_99_state)
-    end,
-    rules = _99_state.rules,
-  })
-end
-
---- @param opts? _99.ops.Opts
-function _99.fill_in_function(opts)
-  opts = process_opts(opts)
-  ops.fill_in_function(get_context("fill_in_function"), opts)
+--- @param opts? _99.ops.SearchOpts
+function _99.search(opts)
+  local o = process_opts(opts) --[[ @as _99.ops.SearchOpts ]]
+  local context = get_context("search")
+  if o.additional_prompt then
+    ops.search(context, o)
+    return
+  else
+    capture_prompt(ops.search, "Search", context, o)
+  end
 end
 
 --- @param opts _99.ops.Opts
-function _99.visual_prompt(opts)
+function _99.tutorial(opts)
   opts = process_opts(opts)
-  local context = get_context("over-range-with-prompt")
-  context.logger:debug("start")
-  Window.capture_input({
-    cb = wrap_window_capture(function(ok, o)
-      if not ok then
-        return
-      end
-      assert(o ~= nil, "if ok, then opts must exist")
-      _99.visual(context, o)
-    end, context, opts),
-    on_load = function()
-      Extensions.setup_buffer(_99_state)
-    end,
-    rules = _99_state.rules,
-  })
+  local context = get_context("tutorial")
+  if opts.additional_prompt then
+    ops.tutorial(context, opts)
+  else
+    capture_prompt(ops.tutorial, "Tutorial", context, opts)
+  end
 end
 
---- @param context _99.RequestContext?
 --- @param opts _99.ops.Opts?
-function _99.visual(context, opts)
+function _99.visual(opts)
   opts = process_opts(opts)
-  --- TODO: Talk to teej about this.
-  --- Visual selection marks are only set in place post visual selection.
-  --- that means for this function to work i must escape out of visual mode
-  --- which i dislike very much.  because maybe you dont want this
-  set_selection_marks()
-
-  context = context or get_context("over-range")
-  local range = Range.from_visual_selection()
-  ops.over_range(context, range, opts)
+  local context = get_context("visual")
+  local function perform_range()
+    set_selection_marks()
+    local range = Range.from_visual_selection()
+    ops.over_range(context, range, opts)
+  end
+  if opts.additional_prompt then
+    perform_range()
+  else
+    capture_prompt(perform_range, "Visual", context, opts)
+  end
 end
 
 --- View all the logs that are currently cached.  Cached log count is determined
@@ -401,23 +414,46 @@ function _99.next_request_logs()
   Window.display_full_screen_message(logs[_99_state.__view_log_idx])
 end
 
+--- @class _99.QFixEntry
+--- @field filename string
+--- @field lnum number
+--- @field col number
+--- @field text string
+
+--- @param entry _99.RequestEntry
+--- @return _99.QFixEntry
+local function request_entry_to_qfix_item(entry)
+  local context = entry.context
+  local point = entry.point
+  local text = string.format("[%s] %s", entry.status, entry.context.operation)
+
+  return {
+    filename = context and context.full_path or "",
+    lnum = point and point.row or 0,
+    col = point and point.col or 0,
+    text = text,
+  }
+end
+
 function _99.stop_all_requests()
-  for _, active in pairs(_99_state.__active_requests) do
-    _99_state:remove_request(active.request_id)
-    active.clean_up()
+  for _, request in pairs(_99_state.__request_by_id) do
+    if request.status == "requesting" then
+      request.context:stop()
+    end
   end
-  _99_state.__active_requests = {}
+end
+
+function _99.clear_all_marks()
+  for _, mark in ipairs(_99_state.__active_marks or {}) do
+    mark:delete()
+  end
+  _99_state.__active_marks = {}
 end
 
 function _99.previous_requests_to_qfix()
   local items = {}
   for _, entry in ipairs(_99_state.__request_history) do
-    table.insert(items, {
-      filename = entry.filename,
-      lnum = entry.lnum,
-      col = entry.col,
-      text = string.format("[%s] %s", entry.status, entry.operation),
-    })
+    table.insert(items, request_entry_to_qfix_item(entry))
   end
   vim.fn.setqflist({}, "r", { title = "99 Requests", items = items })
   vim.cmd("copen")
@@ -433,10 +469,70 @@ function _99.__get_state()
   return _99_state
 end
 
+local function shut_down_in_flight_requests_window()
+  if _99_state.show_in_flight_requests_throbber then
+    _99_state.show_in_flight_requests_throbber:stop()
+  end
+
+  local win = _99_state.show_in_flight_requests_window
+  if win ~= nil then
+    Window.close(win)
+  end
+  _99_state.show_in_flight_requests_window = nil
+  _99_state.show_in_flight_requests_throbber = nil
+end
+
+local function show_in_flight_requests()
+  if _99_state.show_in_flight_requests == false then
+    return
+  end
+  vim.defer_fn(show_in_flight_requests, 1000)
+
+  Window.refresh_active_windows()
+  local current_win = _99_state.show_in_flight_requests_window
+  if current_win ~= nil and not Window.is_active_window(current_win) then
+    shut_down_in_flight_requests_window()
+  end
+
+  if Window.has_active_windows() or _99_state:active_request_count() == 0 then
+    return
+  end
+
+  if _99_state.show_in_flight_requests_window == nil then
+    local win = Window.status_window()
+    local throb = Throbber.new(function(throb)
+      local count = _99_state:active_request_count()
+      if count == 0 or not Window.valid(win) then
+        return shut_down_in_flight_requests_window()
+      end
+
+      --- @type string[]
+      local lines = {
+        throb .. " requests(" .. tostring(count) .. ") " .. throb,
+      }
+
+      for _, r in pairs(_99_state.__request_by_id) do
+        if r.status == "requesting" then
+          table.insert(lines, r.context.operation)
+        end
+      end
+
+      Window.resize(win, #lines[1], #lines)
+      vim.api.nvim_buf_set_lines(win.buf_id, 0, 1, false, lines)
+    end)
+    _99_state.show_in_flight_requests_window = win
+    _99_state.show_in_flight_requests_throbber = throb
+
+    throb:start()
+  end
+end
+
 --- @param opts _99.Options?
 function _99.setup(opts)
   opts = opts or {}
+
   _99_state = _99_State.new()
+  _99_state.show_in_flight_requests = opts.show_in_flight_requests or false
   _99_state.provider_override = opts.provider
   _99_state.completion = opts.completion
     or {
@@ -445,6 +541,7 @@ function _99.setup(opts)
     }
   _99_state.completion.custom_rules = _99_state.completion.custom_rules or {}
   _99_state.auto_add_skills = opts.auto_add_skills or false
+  _99_state.completion.files = _99_state.completion.files or {}
 
   local crules = _99_state.completion.custom_rules
   for i, rule in ipairs(crules) do
@@ -482,6 +579,11 @@ function _99.setup(opts)
   _99_state:refresh_rules()
   Languages.initialize(_99_state)
   Extensions.init(_99_state)
+  Extensions.capture_project_root()
+
+  if _99_state.show_in_flight_requests then
+    show_in_flight_requests()
+  end
 end
 
 --- @param md string
@@ -518,5 +620,4 @@ function _99.__debug()
 end
 
 _99.Providers = Providers
-
 return _99

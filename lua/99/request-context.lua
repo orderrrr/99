@@ -15,6 +15,7 @@ local random_file = utils.random_file
 --- @field xid number
 --- @field range _99.Range?
 --- @field operation string?
+--- @field clean_ups (fun(): nil)[]
 --- @field _99 _99.State
 local RequestContext = {}
 RequestContext.__index = RequestContext
@@ -38,6 +39,7 @@ function RequestContext.from_current_buffer(_99, xid)
 
   return setmetatable({
     _99 = _99,
+    clean_ups = {},
     md_file_names = mds,
     ai_context = {},
     tmp_file = random_file(),
@@ -51,6 +53,17 @@ function RequestContext.from_current_buffer(_99, xid)
   }, RequestContext)
 end
 
+function RequestContext:stop()
+  for _, cb in ipairs(self.clean_ups) do
+    cb()
+  end
+end
+
+--- @param clean_up fun(): nil
+function RequestContext:add_clean_up(clean_up)
+  table.insert(self.clean_ups, clean_up)
+end
+
 --- @param md_file_name string
 --- @return self
 function RequestContext:add_md_file_name(md_file_name)
@@ -58,36 +71,11 @@ function RequestContext:add_md_file_name(md_file_name)
   return self
 end
 
---- TODO: Dedupe any rules that have already been added
---- @param rules (_99.Agents.Rule | string)[]
-function RequestContext:add_agent_rules(rules)
-  for _, rule in ipairs(rules) do
-    -- Handle both string paths and rule objects
-    self.logger:debug("adding custom rule to agent", "rule", rule)
-    local ok, file = pcall(io.open, rule.path, "r")
-    if ok and file then
-      local content = file:read("*a")
-      file:close()
-      self.logger:info(
-        "Context#adding agent file to the context",
-        "agent_path",
-        rule.path
-      )
-      table.insert(
-        self.ai_context,
-        string.format(
-          [[
-<%s>
-%s
-</%s>]],
-          rule.name,
-          content,
-          rule.name
-        )
-      )
-    else
-      self.logger:debug("unable to read agent rule", "rule", rule)
-    end
+--- @param refs _99.Reference[]
+function RequestContext:add_references(refs)
+  for _, ref in ipairs(refs) do
+    self.logger:debug("adding reference to context")
+    table.insert(self.ai_context, ref.content)
   end
 end
 
@@ -127,6 +115,13 @@ end
 --- @param prompt string
 function RequestContext:save_prompt(prompt)
   local prompt_file = self.tmp_file .. "-prompt"
+
+  local dir = vim.fs.dirname(prompt_file)
+
+  if dir and not vim.uv.fs_stat(dir) then
+    pcall(vim.uv.fs_mkdir, dir, 493)
+  end
+
   local file = io.open(prompt_file, "w")
   if file then
     file:write(prompt)

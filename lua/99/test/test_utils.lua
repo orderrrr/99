@@ -1,3 +1,5 @@
+local BaseProvider = require("99.providers").BaseProvider
+local Levels = require("99.logger.level")
 local M = {}
 
 function M.next_frame()
@@ -47,6 +49,7 @@ end
 function TestProvider:resolve(status, result)
   assert(self.request, "you cannot call resolve until make_request is called")
   local obs = self.request.observer
+
   if obs then
     --- to match the behavior expected from the OpenCodeProvider
     if self.request.request:is_cancelled() then
@@ -101,6 +104,32 @@ function M.create_file(contents, file_type, row, col)
 
   table.insert(M.created_files, bufnr)
   return bufnr
+end
+
+--- @param content string[]
+--- @param row number
+--- @param col number
+--- @param lang string?
+--- @return _99.test.Provider, number
+function M.test_setup(content, row, col, lang)
+  assert(lang, "lang must be provided")
+  local provider = M.TestProvider.new()
+  require("99").setup({
+    provider = provider,
+    logger = {
+      error_cache_level = Levels.ERROR,
+      type = "print",
+    },
+  })
+
+  local buffer = M.create_file(content, lang, row, col)
+  return provider, buffer
+end
+
+--- @param buffer number
+--- @return string[]
+function M.r(buffer)
+  return vim.api.nvim_buf_get_lines(buffer, 0, -1, false)
 end
 
 return M

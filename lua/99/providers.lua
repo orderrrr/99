@@ -2,14 +2,7 @@
 --- @field on_stdout fun(line: string): nil
 --- @field on_stderr fun(line: string): nil
 --- @field on_complete fun(status: _99.Request.ResponseState, res: string): nil
-
---- @type _99.Providers.Observer
-local DevNullObserver = {
-  name = "DevNullObserver",
-  on_stdout = function() end,
-  on_stderr = function() end,
-  on_complete = function() end,
-}
+--- @field on_start fun(): nil
 
 --- @param fn fun(...: any): nil
 --- @return fun(...: any): nil
@@ -56,15 +49,21 @@ end
 
 --- @param query string
 --- @param request _99.Request
---- @param observer _99.Providers.Observer?
+--- @param observer _99.Providers.Observer
 function BaseProvider:make_request(query, request, observer)
+  observer.on_start()
+
   local logger = request.logger:set_area(self:_get_provider_name())
   logger:debug("make_request", "tmp_file", request.context.tmp_file)
 
-  observer = observer or DevNullObserver
-  local once_complete = once(function(status, text)
-    observer.on_complete(status, text)
-  end)
+  local once_complete = once(
+    --- @param status "success" | "failed" | "cancelled"
+    ---@param text string
+    function(status, text)
+      request.state = status
+      observer.on_complete(status, text)
+    end
+  )
 
   local command = self:_build_command(query, request)
   logger:debug("make_request", "command", command)
@@ -141,7 +140,15 @@ local OpenCodeProvider = setmetatable({}, { __index = BaseProvider })
 --- @param request _99.Request
 --- @return string[]
 function OpenCodeProvider._build_command(_, query, request)
-  return { "opencode", "run", "-m", request.context.model, query }
+  return {
+    "opencode",
+    "run",
+    "--agent",
+    "build",
+    "-m",
+    request.context.model,
+    query,
+  }
 end
 
 --- @return string
@@ -201,8 +208,38 @@ function CursorAgentProvider._get_default_model()
   return "sonnet-4.5"
 end
 
+--- @class KiroProvider : _99.Providers.BaseProvider
+local KiroProvider = setmetatable({}, { __index = BaseProvider })
+
+--- @param query string
+--- @param request _99.Request
+--- @return string[]
+function KiroProvider._build_command(_, query, request)
+  return {
+    "kiro-cli",
+    "chat",
+    "--no-interactive",
+    "--model",
+    request.context.model,
+    "--trust-all-tools",
+    query,
+  }
+end
+
+--- @return string
+function KiroProvider._get_provider_name()
+  return "KiroProvider"
+end
+
+--- @return string
+function KiroProvider._get_default_model()
+  return "claude-sonnet-4.5"
+end
+
 return {
+  BaseProvider = BaseProvider,
   OpenCodeProvider = OpenCodeProvider,
   ClaudeCodeProvider = ClaudeCodeProvider,
   CursorAgentProvider = CursorAgentProvider,
+  KiroProvider = KiroProvider,
 }
