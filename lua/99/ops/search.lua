@@ -36,10 +36,9 @@ local function parse_line(line)
   }
 end
 
---- @param _99 _99.State
+--- @param context _99.RequestContext
 --- @param response string
-local function create_search_locations(_99, response)
-  _ = _99
+local function create_search_locations(context, response)
   local lines = vim.split(response, "\n")
   local qf_list = {}
 
@@ -49,10 +48,13 @@ local function create_search_locations(_99, response)
       table.insert(qf_list, res)
     end
   end
+  context._99:add_data(context, {
+    type = "search",
+    qfix_items = qf_list,
+  })
 
   if #qf_list > 0 then
-    vim.fn.setqflist(qf_list, "r")
-    vim.cmd("copen")
+    require("99").qfix_search_results(context.xid)
   else
     vim.notify("No search results found", vim.log.levels.INFO)
   end
@@ -75,7 +77,6 @@ local function search(context, opts)
   local prompt, refs =
     make_prompt(context, context._99.prompts.prompts.semantic_search(), opts)
 
-
   request:add_prompt_content(prompt)
   context:add_references(refs)
   context:add_clean_up(clean_up)
@@ -90,7 +91,7 @@ local function search(context, opts)
         response or "no response provided"
       )
     elseif status == "success" then
-      create_search_locations(context._99, response)
+      create_search_locations(context, response)
     end
   end))
 end

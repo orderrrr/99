@@ -43,18 +43,14 @@ end
 
 --- @alias _99.Cleanup fun(): nil
 
---- @class _99.RequestEntry.Data.Tutorial
---- @field type "tutorial"
---- @field title string
---- @field content string[]
-
 --- @class _99.RequestEntry.Data.Search
 --- @field type "search"
+--- @field qfix_items _99.Search.Result[]
 
 --- @class _99.RequestEntry.Data.Visual
 --- @field type "visual"
 
----
+-- luacheck: ignore
 --- @alias _99.RequestEntry.Data _99.RequestEntry.Data.Search | _99.RequestEntry.Data.Tutorial | _99.RequestEntry.Data.Visual
 
 --- @class _99.RequestEntry
@@ -75,10 +71,9 @@ end
 --- @field auto_add_skills boolean
 --- @field provider_override _99.Providers.BaseProvider?
 --- @field __view_log_idx number
---- @field __tutorials _99.RequestEntry.Data.Tutorial[]
---- @field __searches _99.RequestEntry.Data.Search[]
 --- @field __request_history _99.RequestEntry[]
 --- @field __request_by_id table<number, _99.RequestEntry>
+--- @field tmp_dir string | nil
 
 --- @return _99.StateProps
 local function create_99_state()
@@ -92,16 +87,15 @@ local function create_99_state()
     display_errors = false,
     provider_override = nil,
     auto_add_skills = false,
-    __tutorials = {},
-    __searches = {},
     __view_log_idx = 1,
     __request_history = {},
     __request_by_id = {},
+    tmp_dir = nil,
   }
 end
 
 --- @class _99.Completion
---- @field source "cmp" | nil
+--- @field source "cmp" | "blink" | nil
 --- @field custom_rules string[]
 --- @field files _99.Files.Config?
 
@@ -115,6 +109,7 @@ end
 --- @field display_errors? boolean
 --- @field auto_add_skills? boolean
 --- @field completion _99.Completion?
+--- @field tmp_dir? string
 
 --- unanswered question -- will i need to queue messages one at a time or
 --- just send them all...  So to prepare ill be sending around this state object
@@ -134,10 +129,9 @@ end
 --- @field rules _99.Agents.Rules
 --- @field __view_log_idx number
 --- @field __request_history _99.RequestEntry[]
---- @field __tutorials _99.RequestEntry.Data.Tutorial[]
---- @field __searches _99.RequestEntry.Data.Search[]
 --- @field __request_by_id table<number, _99.RequestEntry>
 --- @field __active_marks _99.Mark[]
+--- @field tmp_dir string | nil
 local _99_State = {}
 _99_State.__index = _99_State
 
@@ -161,6 +155,9 @@ function _99_State:refresh_rules()
   self.rules = Agents.rules(self)
   Extensions.refresh(self)
 end
+
+--- @param tutorial _99.RequestEntry.Data.Tutorial
+function _99_State:open_tutorial(tutorial) end
 
 --- @param context _99.RequestContext
 --- @return _99.RequestEntry
@@ -193,19 +190,12 @@ function _99_State:finish_request(context, status)
   end
 
   entry.status = status
-  local data = entry.operation_data
-  if entry.status == "success" and data then
-    if data.type == "tutorial" then
-      table.insert(self.__tutorials, data)
-    elseif data.type == "search" then
-      table.insert(self.__searches, data)
-    end
-  end
 end
 
---- @param id number
+--- @param context _99.RequestContext
 ---@param data _99.RequestEntry.Data
-function _99_State:add_data(id, data)
+function _99_State:add_data(context, data)
+  local id = context.xid
   local entry = self.__request_by_id[id]
   if not entry then
     return
@@ -239,8 +229,6 @@ function _99_State:clear_previous_requests()
     end
   end
   self.__request_history = keep
-  self.__searches = {}
-  self.__tutorials = {}
 end
 
 --- @param mark _99.Mark
@@ -256,6 +244,19 @@ function _99_State:active_request_count()
     end
   end
   return count
+end
+
+--- @param type "search" | "visual" | "tutorial"
+--- @return _99.RequestEntry.Data
+function _99_State:get_request_data_by_type(type)
+  local out = {}
+  for _, r in ipairs(self.__request_history) do
+    local data = r.operation_data
+    if data and data.type == type then
+      table.insert(out, data)
+    end
+  end
+  return out
 end
 
 local _99_state = _99_State.new()
@@ -278,8 +279,11 @@ end
 --- @param name string
 --- @param context _99.RequestContext
 --- @param opts _99.ops.Opts
-local function capture_prompt(cb, name, context, opts)
+--- @param capture_content string[] | nil
+local function capture_prompt(cb, name, context, opts, capture_content)
   Window.capture_input(name, {
+    content = capture_content,
+
     --- @param ok boolean
     --- @param response string
     cb = function(ok, response)
@@ -336,6 +340,56 @@ function _99.info()
   Window.display_centered_message(info)
 end
 
+--- @param tutorials _99.RequestEntry.Data.Tutorial[]
+--- @return string[]
+local function tutorial_to_string(tutorials)
+  local out = {}
+  for _, t in ipairs(tutorials) do
+    table.insert(out, string.format("%d: %s", t.xid, t.tutorial[1]))
+  end
+  return out
+end
+
+--- @param xid number | nil
+--- @param opts? _99.window.SplitWindowOpts
+function _99.open_tutorial(xid, opts)
+  opts = opts or { split_direction = "vertical" }
+  if xid == nil then
+    local tutorials = _99_state:get_request_data_by_type("tutorial")
+    if #tutorials == 0 then
+      print("no tutorials available")
+    elseif #tutorials == 1 then
+      local data = tutorials[1].operation_data
+      assert(data, "tutorial is malformed")
+      Window.create_split(data.tutorial, data.buffer, opts)
+    else
+      local context = get_context("tutorial-lookup")
+      capture_prompt(function(_, o)
+        local response = o.additional_prompt
+        local lines = vim.split(response, "\n")
+        for _, l in ipairs(lines) do
+          local id = tonumber(vim.split(l, ":")[1])
+          if not id then
+            error(
+              "do not alter the tutoria lines, just delete the ones you dont want"
+            )
+          end
+          local tut = _99_state.__request_by_id[id]
+          local data = tut and tut.operation_data
+          assert(data and data.type == "tutorial", "invalid tutorial selected")
+          Window.create_split(data.tutorial, data.buffer, opts)
+        end
+      end, "Select Tutorial", context, {}, tutorial_to_string(tutorials))
+    end
+    return
+  end
+
+  local tutorial = _99_state.__request_by_id[xid]
+  local data = tutorial and tutorial.operation_data
+  assert(data and data.type == "tutorial", "cannot open a non tutorial")
+  Window.create_split(data.tutorial, data.buffer, opts)
+end
+
 --- @param path string
 function _99:rule_from_path(path)
   _ = self
@@ -344,15 +398,16 @@ function _99:rule_from_path(path)
 end
 
 --- @param opts? _99.ops.SearchOpts
+--- @return number
 function _99.search(opts)
   local o = process_opts(opts) --[[ @as _99.ops.SearchOpts ]]
   local context = get_context("search")
   if o.additional_prompt then
     ops.search(context, o)
-    return
   else
     capture_prompt(ops.search, "Search", context, o)
   end
+  return context.xid
 end
 
 --- @param opts _99.ops.Opts
@@ -420,21 +475,6 @@ end
 --- @field col number
 --- @field text string
 
---- @param entry _99.RequestEntry
---- @return _99.QFixEntry
-local function request_entry_to_qfix_item(entry)
-  local context = entry.context
-  local point = entry.point
-  local text = string.format("[%s] %s", entry.status, entry.context.operation)
-
-  return {
-    filename = context and context.full_path or "",
-    lnum = point and point.row or 0,
-    col = point and point.col or 0,
-    text = text,
-  }
-end
-
 function _99.stop_all_requests()
   for _, request in pairs(_99_state.__request_by_id) do
     if request.status == "requesting" then
@@ -450,12 +490,18 @@ function _99.clear_all_marks()
   _99_state.__active_marks = {}
 end
 
-function _99.previous_requests_to_qfix()
-  local items = {}
-  for _, entry in ipairs(_99_state.__request_history) do
-    table.insert(items, request_entry_to_qfix_item(entry))
-  end
-  vim.fn.setqflist({}, "r", { title = "99 Requests", items = items })
+--- @param xid number | nil
+function _99.qfix_search_results(xid)
+  --- @type _99.RequestEntry
+  local entry = _99_state.__request_by_id[xid]
+  assert(entry, "qfix_search_results could not find id: " .. xid)
+
+  local data = entry.operation_data
+  assert(data, "there must be data associated with request entry")
+  assert(data.type == "search", "the operation_data must be type search")
+
+  local items = data.qfix_items
+  vim.fn.setqflist({}, "r", { title = "99 Search Results", items = items })
   vim.cmd("copen")
 end
 
@@ -575,6 +621,11 @@ function _99.setup(opts)
     end
   end
 
+  if opts.tmp_dir then
+    assert(type(opts.tmp_dir) == "string", "opts.tmp_dir must be a string")
+  end
+  _99_state.tmp_dir = opts.tmp_dir
+
   _99_state.display_errors = opts.display_errors or false
   _99_state:refresh_rules()
   Languages.initialize(_99_state)
@@ -620,4 +671,7 @@ function _99.__debug()
 end
 
 _99.Providers = Providers
+_99.Extensions = {
+  Worker = require("99.extensions.work.worker"),
+}
 return _99
